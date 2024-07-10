@@ -1,0 +1,1338 @@
+---
+title: "Comparative Metataxonomy: Yuri"
+author: "Roberto Siani"
+date: "23/11/2021"
+---
+
+PROJECT NOTES: insert short intro to project here
+
+# SETUP
+
+Set up working environment: packages and default graphic themes.
+
+```{r, cache = TRUE, echo = FALSE, include = FALSE}
+
+
+# helper script
+
+source("~/00_lib/scripts/helpeR.R")
+
+# load basics
+
+p_load(
+  microbiome,
+  phyloseq
+)
+
+# define functions
+
+select = dplyr::select
+transform = microbiome::transform
+
+```
+
+# PRE-PROCESS
+
+## SELECT PATHS
+
+Here we define the path to the output of Qiime2/DADA2, plus a table with metadata and the ID of any negative control samples.
+
+```{r}
+
+metadata_table = "01_inData/metadata_220322.csv"
+
+taxonomic_assignment = "01_inData/1_round/Galaxy1969-[dada2__assignTaxonomy_and_addSpecies_on_data_1968_and_data_1957].tabular"
+taxonomic_assignment2 = "01_inData/2_round/Galaxy1963-[dada2__assignTaxonomy_and_addSpecies_on_data_1962_and_data_1947].tabular"
+
+counts_table = "01_inData/1_round/Galaxy1957-[dada2__removeBimeraDenovo_on_data_1955].dada2_sequencetable"
+counts_table2 = "01_inData/2_round/Galaxy1947-[dada2__removeBimeraDenovo_on_data_1945].dada2_sequencetable"
+
+control_samples = c("X166_S82_L001_R1_001.fastq.gz",
+                     "X167_S83_L001_R1_001.fastq.gz",
+                    "Yuri164_S33_L001_R1_001.fastq.gz",
+                    "Yuri165_S34_L001_R1_001.fastq.gz")
+
+```
+
+## PRE-PROCESS
+
+All the results are cleaned and merged into a phyloseq-object
+
+```{r}
+
+# import metadata
+
+metaTab =
+  read_tsv(metadata_table) %>%
+  mutate_if(is_character, as.factor) %>% 
+  separate(col = Plot,
+           into = c("Block", "Plot"),
+           sep = "[aA]")
+
+# import and clean taxonomy
+
+raw_taxTab =
+  read_tsv(taxonomic_assignment) %>% 
+  full_join(read_tsv(taxonomic_assignment2),
+            by = "...1") %>% 
+  mutate_if(is_character, str_trim) %>% 
+  map_df(~ gsub(
+    pattern = "metagenome|uncultured|unidentified|Unknown| |  ",
+    replacement = NA,
+    .x
+  )) %>% 
+  transmute(
+    ASV = `...1`,
+    Domain = coalesce(domain.x, domain.y),
+    Phylum = coalesce(phylum.x, phylum.y),
+    Class = coalesce(class.x, class.y),
+    Order = coalesce(order.x, order.y),
+    Family = coalesce(family.x, family.y),
+    Genus = coalesce(genus.x, genus.y),
+    Species = coalesce(species.x, species.y)
+    ) %>%
+  mutate(
+    Domain = ifelse(is.na(Domain),
+                    "U. Domain",
+                    Domain
+    ),
+    Phylum = coalesce(
+      Phylum,
+      ifelse(grepl("^U.", Domain),
+             Domain,
+             paste("U.", Domain)
+      )
+    ),
+    Class = coalesce(
+      Class,
+      ifelse(grepl("^U.", Phylum),
+             Phylum,
+             paste("U.", Phylum)
+      )
+    ),
+    Order = coalesce(
+      Order,
+      ifelse(grepl("^U.", Class),
+             Class,
+             paste("U.", Class)
+      )
+    ),
+    Family = coalesce(
+      Family,
+      ifelse(grepl("^U.", Order),
+             Order,
+             paste("U.", Order)
+      )
+    ),
+    Genus = coalesce(
+      Genus,
+      ifelse(grepl("^U.", Family),
+             Family,
+             paste("U.", Family)
+      )
+    ),
+    Species = coalesce(
+      Species,
+      ifelse(grepl("^U.", Genus),
+             Genus,
+             paste("U.", Genus)
+      )
+    )
+  ) %>%
+  column_to_rownames('ASV') %>% 
+  filter(Domain %in% "Bacteria" &
+           !Order %in% "Chloroplast" &
+           !Family %in% "Mitochondria")
+
+# import counts table
+
+raw_abuTab =
+  read_tsv(counts_table) %>%
+  full_join(read_tsv(counts_table2),
+            by = "...1") %>% 
+  column_to_rownames('...1') %>% 
+  replace(is.na(.), 0) 
+
+summary((colSums(raw_abuTab)))
+
+# clean counts table
+
+dc_abuTab =
+  raw_abuTab[
+    -decontam::isContaminant(
+      t(raw_abuTab),
+      neg = c(colnames(raw_abuTab) %in%
+                control_samples),
+      batch = c(rep(1, 87), rep(2, 77)),
+      threshold = .1,
+      normalize = T,
+      detailed = F
+    ),] %>%
+  select_if(!names(.) %in% control_samples) %>%
+  select(-c(Undetermined_S0_L001_R1_001.fastq.gz, Yuri123_S18_L001_R1_001.fastq.gz)) %>%
+  filter(rowSums(.) > 0 &
+    rownames(.) %in% rownames(raw_taxTab))
+
+# clean reads per sample
+
+summary((colSums(dc_abuTab)))
+
+# remove batch effect
+
+seq_run = 
+  metaTab$Sequenc[match(names(dc_abuTab), metaTab$Sequencing_name)] %>%
+  factor(levels = c("2", "1"))
+
+abuTab =
+  dc_abuTab %>%
+  as.matrix() %>%
+  sva::ComBat_seq(
+    batch = seq_run)
+
+colSums(dc_abuTab) - colSums(abuTab)
+
+# filtered reads
+
+colSums(raw_abuTab)[!colnames(raw_abuTab) %in% c(control_samples, "Undetermined_S0_L001_R1_001.fastq.gz", "Yuri123_S18_L001_R1_001.fastq.gz")] - c(colSums(abuTab))
+
+# final cleaning of taxonomy table and metadata table
+
+taxTab =
+  raw_taxTab %>%
+  filter(rownames(.) %in%
+    rownames(abuTab)) %>% 
+  as.matrix()
+
+metaTab =
+  metaTab %>% 
+  filter(Sequencing_name %in% colnames(abuTab)) %>% 
+  droplevels() %>% 
+  column_to_rownames("Sequencing_name") %>% 
+  mutate(depth = colSums(abuTab))
+
+# multi-alignment to predict phylogenetic tree
+# this step is long and not always necessary 
+# --> run it if you need tree-based stuff
+
+# treeObj =
+#   phyDat(
+#     as(
+#       AlignSeqs(
+#         DNAStringSet(
+#           x = rownames(abuTab) %>%
+#             set_names(),
+#           use.names = T
+#         ),
+#         anchor = NA,
+#         verbose = F
+#       ),
+#       "matrix"
+#     ),
+#     type = "DNA"
+#   ) %>%
+#   pml(dist.ml(.) %>%
+#     NJ(),
+#   data = .
+#   ) 
+
+# import into phyloseq-object (add tree if you computed it)
+
+mCom =
+  phyloseq(
+    otu_table(abuTab,
+      taxa_are_rows = T),
+    tax_table(taxTab),
+    sample_data(metaTab))
+
+# save your object to avoid computing it everytime
+
+save(mCom,
+  file = paste("03_outData/mCom",
+    format(Sys.time(), "_%d%m%y_%H%M"),
+    ".RData",
+    sep = ""
+  )
+)
+
+# free up memory
+
+rm(list = grep("Tab", ls(), value = T))
+rm(list = grep("[a-z]_[a-z]", ls(), value = T))
+gc()
+
+```
+
+# INPUT
+
+```{r, echo = FALSE, include = FALSE}
+
+# load your mCom dataset
+
+load("03_outData/mCom_190523_1049.RData")
+
+# check your summary
+
+summarize_phyloseq(mCom)
+
+# define a color palette for data viz
+
+palette_list =
+  list(
+    Treatment = c("#b5179e", "#4361ee"),
+    Diversity = c("#8FBB76", "#FCC76A", "#F4A755", "#E06C79", "#8A5F9E", "#519FB0")
+  )
+
+pal_divTr = 
+  paletteer::paletteer_d("ggthemes::Tableau_20")[c(17, 18, 9, 10, 5, 6, 
+                                                   7, 8, 3, 4, 11, 12)] 
+  
+palette_tr = 
+  c("#BAB0AC", "#4E79A7")
+
+
+# check if you have correlation between covariates and seq intensity
+
+colSums_df = 
+  colSums(mCom@otu_table) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("sample_names") %>% 
+  left_join(meta(mCom) %>% 
+              rownames_to_column("sample_names"))
+
+res_lm = 
+  glm(`.` ~ Diversity_lvl + Sequenc + Block + Treatment,
+     data = colSums_df, family = "poisson")
+
+anova(res_lm)
+
+# check the seq intensity by sample or by group
+
+ggplot(colSums_df) +
+  geom_bar(stat = "identity",
+           position  = "dodge",
+           aes(x = `.`,
+               y = sample_names,
+               fill = Treatment)) +
+  facet_wrap(~Diversity_lvl,
+             scales = "free_y") +
+  scale_fill_manual(values = palette_list$Treatment) +
+  theme(axis.text.y = element_text(size = 10),
+        axis.text.x = element_text(size = 10))
+
+# check that all levels are approximately equal
+
+table(meta(mCom)$Treatment, 
+      meta(mCom)$Diversity_lvl,
+      meta(mCom)$Block,
+      meta(mCom)$Sequenc)
+
+# fix level orders
+
+
+sample_data(mCom)$log_sowndiv = log(sample_data(mCom)$SOWNDIV2)
+
+sample_data(mCom)$Diversity_lvl = factor(sample_data(mCom)$Diversity_lvl,
+                                         levels = c("1", "2", "4",
+                                                    "8", "16", "60"))
+
+sample_data(mCom)$Diversity_gradient = as.numeric(sample_data(mCom)$Diversity_lvl)
+
+sample_data(mCom)$Diversity_trt = paste(sample_data(mCom)$Diversity_lvl,
+                                        ifelse(sample_data(mCom)$Treatment %in% "roof1", "drought", "control"), 
+                                        sep = "-") %>% 
+  factor(levels = c("1-control", "1-drought",  "2-control", 
+                    "2-drought", "4-control", "4-drought", "8-control", "8-drought",
+                    "16-control", "16-drought", "60-control", "60-drought"))
+
+sample_data(mCom)$Treatment = ifelse(sample_data(mCom)$Treatment %in% "roof1", "drought", "control") %>% 
+  factor(levels = c("control", "drought"))
+
+# for heavily left-skewed distributions, you might want to filter out some rare taxa
+
+pf_mCom =
+  mCom %>% 
+  prune_taxa(prevalence(., detection  = 0) >= 0.05, .)
+
+# see the differences in number of taxa
+
+ntaxa(mCom)
+
+ntaxa(pf_mCom)
+
+mCom =
+  pf_mCom %>% 
+  prune_taxa(taxa_sums(.) > 0, .)
+
+ntaxa(mCom)
+
+summarize_phyloseq(mCom)
+
+```
+
+# OUTPUT
+
+### Relative Abundance
+
+```{r}
+
+# function for relative abundance
+
+plotRelativeAbundance = 
+  function(level, thresh, var1, var2) {
+  mCom %>%
+    transform("compositional") %>%
+    speedyseq::psmelt() %>%
+    group_by(
+      {{ var1 }},
+      {{ var2 }},
+      {{ level }}
+    ) %>%
+    summarise(Abundance = sum(Abundance)) %>%
+    mutate(taxa = ifelse(
+      Abundance >= quantile(Abundance, thresh),
+      {{ level }},
+      paste("below q", thresh, sep = "")
+    ) %>% as.factor()) %>%
+    ggplot() +
+    geom_bar(
+      stat = "identity",
+      position = "fill",
+      alpha = .75,
+      aes(
+        x = {{ var1 }},
+        y = Abundance,
+        fill = taxa
+      )
+    ) +
+    facet_wrap(vars({{ var2 }}),
+      scales = "free_x",
+      nrow = 1
+    ) +
+    theme(
+      legend.position = "right",
+      axis.title.x = element_blank(),
+      legend.key = element_rect(
+        size = 0,
+        linetype = 0
+      ),
+      axis.title.y = element_blank()
+    )
+}
+
+# plot relative abundance per Phylum, grouping Phyla below the X quantile and displayed by var1 and var2 ()
+
+plot_2 =
+  plotRelativeAbundance(Phylum, 0.8, Treatment, Diversity_lvl) +
+  theme(axis.text.x = element_text(size = 20)) +
+  paletteer::scale_fill_paletteer_d("rcartocolor::Safe")
+
+# save all in a pdf
+
+png("04_figures/01_relativeAbundance.png",
+  width = 16,
+  height = 16,
+  units = "in",
+  res = 300
+)
+plot_2
+dev.off()
+
+```
+
+## Diversity
+
+### Richness and Alpha Diversity
+
+Here we switch from plug-in to estimated measures of Diversity (Shannon, Simpson)
+
+```{r}
+
+res_breakaway =
+  breakaway::breakaway(mCom) %>% 
+  summary() %>% 
+  as_tibble()
+
+sample_data(mCom)$breakaway_estimate = res_breakaway$estimate
+sample_data(mCom)$breakaway_error = res_breakaway$error
+
+sample_data(mCom)$obs_rich = mCom %>% microbiome::richness("observed") %>% pull(observed)
+  
+a =
+  ggplot(
+    data = sample_data(mCom),
+    aes(
+      x = Diversity_lvl,
+      y = breakaway_estimate)
+  ) +
+  geom_boxplot(size = 0.5,
+               aes(fill = Treatment, alpha = Diversity_lvl)) +
+  scale_fill_manual(values = palette_tr) +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  ggpubr::stat_compare_means(method = "kruskal.test")
+
+# calculate Diversity estimates for your samples
+
+set.seed(666)
+
+res_divnet =
+  readRDS("03_outData/res_divnet.RDS")
+
+res_divnet =
+  mCom %>%
+  speedyseq::tax_glom("Family") %>% 
+  DivNet::divnet()
+
+sample_data(mCom)$shannon_estimate = res_divnet$shannon %>% 
+  summary() %>% 
+  pull(estimate) 
+sample_data(mCom)$shannon_error = res_divnet$shannon %>% 
+  summary() %>% 
+  pull(error)
+sample_data(mCom)$simpson_estimate = res_divnet$simpson %>% 
+  summary() %>% 
+  pull(estimate)
+sample_data(mCom)$simpson_error = res_divnet$simpson %>% 
+  summary() %>% 
+  pull(error)
+
+res_divnet$shannon %>% 
+  summary() %>% 
+  pull(estimate) / sqrt(res_divnet$shannon %>% 
+  summary() %>% 
+  pull(error))
+
+# shannon estimates boxplot
+
+plot_5 = 
+  sample_data(mCom) |> 
+  group_by(Diversity_trt, Diversity_lvl, Treatment) |> 
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = T))) |> 
+  ggplot(
+    aes(x = Diversity_lvl,
+        xmin = after_stat(x) - 0.27,
+        xmax = after_stat(x) + 0.27,
+        y = shannon_estimate,
+        ymin = shannon_estimate - shannon_error,
+        ymax = shannon_estimate + shannon_error,
+        fill = Diversity_trt,
+        color = after_scale(colorspace::desaturate(fill, 0.66)))) +
+  geom_rect(aes(),
+            alpha = 1/3,
+            position = position_dodge(width = .3),
+    show.legend = F) +
+  geom_point(
+    aes(y = shannon_estimate,
+        shape = Treatment),
+    size = 5,
+    stroke = 1,
+    position = position_dodge(width = .3)  
+  ) +
+  geom_point(
+    aes(y = shannon_estimate - shannon_error),
+    position = position_dodge(width = .3),
+    shape = 95,
+    size = 30,
+    show.legend = F) +
+  geom_point(
+    aes(y = shannon_estimate + shannon_error),
+    position = position_dodge(width = .3),
+    shape = 95,
+    size = 30,
+    show.legend = F) +
+  scale_fill_manual(values = pal_divTr) +
+  scale_shape_manual(values = c(21, 24))
+
+b = 
+  ggplot(
+    data = sample_data(mCom),
+    aes(
+      x = Diversity_lvl,
+      y = shannon_estimate/sqrt(shannon_error),
+    )
+  ) +
+  geom_boxplot(aes(fill = Diversity_trt)) +
+  scale_fill_manual(values = pal_divTr, aesthetics = c("color", "fill")) +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  ggpubr::stat_compare_means(method = "kruskal.test") +
+  labs(y = "shannon estimate (std.)")
+
+# simpson estimates boxplot
+
+c = 
+  ggplot(
+    data = meta(mCom),
+    aes(
+      x = Diversity_lvl,
+      y = simpson_estimate/simpson_error
+    )
+  ) +
+  geom_boxplot(aes(
+      fill = Diversity_trt)) +
+  scale_fill_manual(values = pal_divTr, aesthetics = c("color", "fill"))  +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  ggpubr::stat_compare_means(method = "kruskal.test") +
+  labs(y = "simpson estimate (std.)")
+
+# all together
+
+plot_5 =
+  b / c +
+  plot_layout(guides = "collect")
+
+png("04_figures/02_alphaDiversity_standardized.png",
+  width = 20,
+  height = 15, 
+  units = "in",
+  res = 300)
+plot_5
+dev.off()s
+
+```
+
+
+
+```{r}
+
+sample_data(mCom)$hill_q0 = 
+  hilldiv::hill_div(otu_table(mCom),
+                    0)
+
+sample_data(mCom)$hill_q1 = 
+  hilldiv::hill_div(otu_table(mCom),
+                    1)
+
+sample_data(mCom)$hill_q2 = 
+  hilldiv::hill_div(otu_table(mCom),
+                    2)
+
+
+a =
+  ggplot(
+    data = meta(mCom) %>% 
+      as.data.frame() %>% 
+      pivot_longer(hill_q0:hill_q2,
+                   values_to = "hill_number",
+                   names_to = "q"),
+    aes(
+      x = Diversity_lvl,
+      y = hill_number)
+  ) +
+  geom_boxplot(size = 0.5,
+               aes(fill = Diversity_trt)) +
+  scale_fill_manual(values = pal_divTr) +
+  theme(
+    legend.position = "bottom",
+    axis.title.x = element_blank()
+  ) +
+  ggpubr::stat_compare_means(method = "kruskal.test",
+                             vjust = 1,
+                             size = 7.5) +
+  facet_wrap(~q, ncol = 1, scales = "free")
+
+
+```
+
+
+### Beta Diversity
+
+```{r}
+
+## testing differences in distance
+
+beta_Diversity_estimates =
+  map(
+    c("bray-curtis", "euclidean") %>%
+      set_names(),
+    ~ res_divnet %>%
+      pluck(.x) %>%
+      as.data.frame() %>%
+      rownames_to_column("sample_names") %>% 
+      left_join(meta(mCom) %>%
+        rownames_to_column("sample_names"),
+      by = "sample_names"
+      )
+  )
+
+p_install(superheat)
+
+res_means =
+  compare_means(
+    value ~ Treatment,
+    data = 
+      beta_Diversity_estimates$`euclidean` %>%
+      pivot_longer(2:(nsamples(mCom) + 1)),
+    method = "wilcox.test",
+    group.by = "Diversity_lvl",
+    p.adjust.method = "BH"
+  )
+
+write_tsv(res_means, "03_outData/aitchison_wilcox.tsv")
+
+set.seed(1)
+
+res.permanova = 
+  vegan::adonis(
+    t(abundances(mCom %>% 
+                   subset_samples(Diversity_lvl != "60"), "clr")) ~ Diversity_lvl * Block + Treatment,
+    data = meta(mCom %>% 
+                   subset_samples(Diversity_lvl != "60")),
+    permutations = 999,
+    method = "euclidean")
+
+res.permanova[[1]]
+
+vegan::anosim(
+  dist(t(abundances(mCom, "clr"))),
+  meta(mCom)$Diversity_lvl,
+  permutations = 999
+)
+
+## PCA 
+
+div_lvl = 
+  sample_data(mCom)$Diversity_lvl[match(colnames(abundances(mCom, "clr")), rownames(sample_data(mCom)))]
+
+res_prcomp =
+  prcomp(t(abundances(mCom, "clr")))
+
+env_covar = 
+  meta(mCom)[rownames(res_prcomp$x),] |> 
+  mutate(pH = replace_na(mean(pH, na.rm = T)), .by = c(Diversity_trt, BLOCK)) |> 
+  mutate(across(where(is.numeric), scale)) |> 
+  select(Soil_moisture.g.g., pH, SOWNDIV2)
+
+env_fit_to_pca = 
+  vegan::envfit(res_prcomp, env_covar)
+
+
+tidy_env_fit = data.frame(
+  labs = c("Soil Moisture", "pH", "Plant Diversity"),
+  env_fit_to_pca$vectors$arrows,
+  r_squared = env_fit_to_pca$vectors$r,
+  pval = env_fit_to_pca$vectors$pvals,
+  padj = p.adjust(env_fit_to_pca$vectors$pvals, "BH"))
+
+source("02_scripts/rescale_pca.R")
+
+plot_6 =
+  ggplot(
+    data = 
+      res_prcomp$x %>%
+      as_tibble(rownames = "sample_names") %>%
+      left_join(meta(mCom) %>%
+                  rownames_to_column("sample_names")),
+      aes(
+        x = PC1,
+        y = PC2
+      )
+  ) +
+  geom_segment(
+    data = tidy_env_fit,
+    aes(x = 0,
+        xend = rescale_pca(PC1, 1),
+        y = 0,
+        yend = rescale_pca(PC2, 2)),
+    arrow = grid::arrow(),
+    linewidth = .5,
+    color = "#333333") +
+  geom_text(
+    data = tidy_env_fit,
+    aes(x = rescale_pca(PC1, 1),
+        y = rescale_pca(PC2, 2),
+        label = labs),
+    color = "#333333",
+    vjust = "outward",
+    hjust = "inward"
+  ) +
+  geom_point(
+    aes(
+      color = Diversity_trt,
+      shape = Treatment,
+    ),
+    size = 1,
+    alpha = 1/4
+  ) +
+  scale_shape_manual(values = c(19, 17))  +
+  scale_color_manual(
+    values = pal_divTr,
+  ) + 
+  labs(
+    x = paste("Dim. 1,", round(summary(res_prcomp)$importance[2, 1], 2)),
+    y = paste("Dim. 2,", round(summary(res_prcomp)$importance[2, 2], 2))
+  ) +
+  theme(legend.position = "right") +
+  ggpp::stat_centroid(
+    aes(color = Diversity_trt,
+        shape = Treatment),
+    size = 5
+  ) +
+  stat_ellipse(
+    aes(
+      color = Diversity_trt,
+      linetype = Treatment,
+    ),
+    alpha = .6
+  )
+
+
+png("04_figures/03_PCA_2.png",
+  width = 16,
+  height = 16,
+  units = "in",
+  res = 300
+)
+plot_6
+dev.off()
+
+```
+
+## DIFFERENTIAL ABUNDANCE
+
+### ANCOM-BC
+
+```{r}
+
+# create unique identifier for Genus
+
+new_tax_table = 
+  mCom@tax_table@.Data %>% 
+  as.data.frame() %>% 
+  mutate(Genus = vctrs::vec_as_names(Genus, repair = "unique") %>% 
+           sub("...", "_", fixed = T, .))
+
+# workaround for something I dindn't have the patience for
+
+mCom_id = 
+  phyloseq(
+    otu_table(mCom@otu_table, taxa_are_rows = T),
+    sample_data(mCom@sam_data),
+    tax_table(new_tax_table %>% 
+                as.matrix))
+
+# mCom_id =
+#   mCom_id %>% 
+#   subset_samples(Diversity_lvl != "60") %>% 
+#   prune_taxa(taxa_sums(.) > 0, .)
+
+# res_ancombc = 
+#   ANCOMBC::ancombc(mCom,
+#                    formula = "log_sowndiv * Treatment",
+#                    p_adj_method = "fdr",
+#                    group = "Diversity_lvl",
+#                    struc_zero = T,
+#                    prv_cut = 0,
+#                    n_cl = 1)
+# 
+# 
+# res_ancombc2 = 
+#   ANCOMBC::ancombc2(mCom,
+#                    fix_formula = "log_sowndiv * Treatment",
+#                    p_adj_method = "fdr",
+#                    prv_cut = 0,
+#                    n_cl = 1)
+
+
+mCom_split = 
+  mCom_id %>% 
+  metagMisc::phyloseq_sep_variable("Diversity_lvl")
+
+res_ancombc_1 =
+  ANCOMBC::ancombc(
+    mCom_split$`1`,
+    formula = "Treatment",
+    group = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+res_ancombc_2 =
+  ANCOMBC::ancombc(
+    mCom_split$`2`,
+    formula = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+res_ancombc_4 =
+  ANCOMBC::ancombc(
+    mCom_split$`4`,
+    formula = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+res_ancombc_8 =
+  ANCOMBC::ancombc(
+    mCom_split$`8`,
+    formula = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+res_ancombc_16 =
+  ANCOMBC::ancombc(
+    mCom_split$`16`,
+    formula = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+res_ancombc_60 =
+  ANCOMBC::ancombc(
+    mCom_split$`60`,
+    formula = "Treatment",
+    p_adj_method = "BH",
+    struc_zero = F,
+    prv_cut = 0
+  )
+
+
+res_ancombc =
+  map(mCom_split,
+      ~ ANCOMBC::ancombc(
+        .x,
+        formula = "Treatment",
+        p_adj_method = "fdr",
+        struc_zero = F,
+        prv_cut = 0
+      ))
+
+source("02_scripts/extract_results.R")
+
+Diversity_lvls = c("lvl_1", "lvl_2", "lvl_4", "lvl_8", "lvl_16", "lvl_60") %>% 
+  set_names()
+
+res_ancombc_df =
+  res_ancombc %>% 
+  set_names(c("1", "2", "4", "8", "16", "60")) %>% 
+  map(~ pluck(.x, "res") |> 
+  list_rbind(names_to = "name")) |> 
+  list_rbind(names_to = "Diversity_lvl") |> 
+  select(1:3, Treatment = "Treatmentdrought") |> 
+  pivot_wider(names_from = name, values_from = Treatment) %>% 
+  mutate(DA = factor(case_when(
+           q_val > 0.01 & q_val <= 0.05 ~ "*",
+           q_val > 0.001 & q_val <= 0.01 ~ "**",
+           q_val > 0.0001 & q_val <= 0.001 ~ "***",
+           q_val <= 0.0001 ~ "****",
+           .default = "ns"), levels = c("ns", "*", "**", "***", "****")),
+         Diversity_lvl = factor(Diversity_lvl,
+                                levels = c("1", "2", "4", "8", "16", "60"))) |> 
+  left_join(tax_table(mCom_id) |> 
+              as.data.frame() |> 
+              rownames_to_column("taxon"))
+
+
+nr15 = c("#62798a", "#009999", "#318991", "#c4587b", "#dd5077")
+
+plot_7 =
+  ggplot(
+    res_ancombc_df,
+    aes(
+      x = Phylum,
+      y = W,
+      shape = DA,
+      fill = DA,
+      color = DA,
+      size = abs(W),
+      alpha = abs(W))) +
+      ggbeeswarm::geom_quasirandom() +
+  scale_shape_manual(values = c(21, 22, 24, 22, 24)) +
+  scale_color_manual(values = c("#757575", rep("#353535", 4))) +
+  scale_fill_manual(values = c("white", nr15[2:5])) +
+  facet_wrap(~Diversity_lvl, nrow = 1,
+             scales = "free_x") +
+  theme(legend.position = "right",
+        axis.text.x = element_blank())
+
+
+
+
+## fucking venn diagrams
+
+temp = 
+  speedyseq::psmelt(mCom %>% transform("compositional")) %>% 
+  group_by(Diversity_lvl, Treatment, OTU) %>% 
+  summarise(Core = all(Abundance > 0),
+            Abundance = sum(Abundance)) %>% 
+  filter(Core == T) %>% 
+  mutate(
+    Diversity_lvl = paste0("lvl_", Diversity_lvl) %>% 
+      factor(levels = c("lvl_1", "lvl_2", "lvl_4", "lvl_8", "lvl_16", "lvl_60"))
+  ) %>% 
+  pivot_wider(
+    names_from =  Treatment,
+    values_from = c(Core, Abundance),
+    values_fill = FALSE,
+    names_sep = "_") |> 
+  mutate(Core_shared = Core_control == T & Core_drought == T,
+         Abundance_shared = Abundance_control + Abundance_drought,
+         Core_control = ifelse(Core_shared == T, F, Core_control),
+         Core_drought = ifelse(Core_shared == T, F, Core_drought)) %>% 
+  pivot_longer(cols = 3:8,
+               names_to = c(".value", "set"),
+               names_sep = "_") %>% 
+  filter(Core == T) %>% 
+  left_join(tax_table(mCom) %>% 
+              as.data.frame() %>% 
+              rownames_to_column("OTU")) %>% 
+  mutate(Phylum = fct_lump(Phylum, n = 10, w = Abundance)) |> 
+  group_by(Diversity_lvl, set, Phylum) %>% 
+  summarise(Abundance = sum(Abundance),
+            count = n())
+
+core_plot = 
+  temp %>% 
+    ggplot() +
+    theme(
+      legend.position = "bottom",
+      panel.spacing.y = unit(0, "lines"),
+      axis.title.x = element_blank(),
+      panel.border = element_blank(),
+      panel.grid.major.x = element_line(linetype = 3, color = "#757575", linewidth = .75),
+      legend.key = element_rect(
+        linewidth = 0,
+        linetype = 0
+      ),
+      axis.title.y = element_blank()) +
+    geom_bar(
+      stat = "identity",
+      position = "stack",
+      alpha = .8,
+      aes(
+        x = Abundance,
+        y = set,
+        fill = Phylum
+      )
+    ) +
+    facet_grid(rows =  vars(Diversity_lvl),
+      scales = "free_y") +
+  geom_text(
+    data = temp |> 
+      summarise(count = sum(count),
+                Abundance = sum(Abundance)),
+    aes(x = Abundance,
+        y = set,
+        label = count),
+    hjust = -.5,
+    size = 16,
+    color = "#333333") +
+  xlim(0, 15) +
+  scale_fill_manual(values = c("#F44336", "#9C27B0", "#3F51B5", "#E91E63", "#009688","#CDDC39", "#03A9F4",
+                                        "#FFEB3B",  "#4CAF50", "#FF9800", "#795548", "#607D8B"))
+
+png("core_barplot.png", width = 1600, height = 1600)
+core_plot
+dev.off()
+
+stack_venn = 
+  map(c("lvl_1", "lvl_2", "lvl_4", "lvl_8", "lvl_16", "lvl_60"), 
+    ~ ggvenn::ggvenn(
+      list(
+        Control = temp %>%
+          filter(Diversity_lvl %in% {{ .x }} &
+                   Core_control == T) %>% pull(OTU),
+        Drought = temp %>% 
+          filter(Diversity_lvl %in% {{ .x }} &
+                   Core_drought == T) %>% pull(OTU)),
+      fill_color = palette_tr,
+      fill_alpha = .3,
+      text_size = 20,
+      set_name_size = 15,
+      show_percentage = F,
+      stroke_color = "#333333",
+      set_name_color = "#333333",
+      text_color = "#333333"
+    ) + ggtitle({{ .x }}) + theme(title = element_text(size = 20)))
+
+
+p1 = stack_venn[[1]] + stack_venn[[2]] + stack_venn[[3]] + stack_venn[[4]] + stack_venn[[5]] +
+  stack_venn[[6]]
+
+png("venn_version4.png", width = 3000, height = 2000)
+p1 + plot_layout(ncol = 3)
+dev.off()
+
+
+
+# by treatment
+
+temp = 
+  speedyseq::psmelt(mCom %>% transform("compositional")) %>% 
+  filter(Treatment %in% "drought") |> 
+  group_by(Diversity_lvl, OTU) %>% 
+  summarise(Core = all(Abundance > 0),
+            Abundance = sum(Abundance)) %>% 
+  filter(Core == T) %>% 
+  mutate(
+    Diversity_lvl = paste0("lvl_", Diversity_lvl) %>% 
+      factor(levels = c("lvl_1", "lvl_2", "lvl_4", "lvl_8", "lvl_16", "lvl_60"))) 
+
+core_plot = 
+  temp %>% 
+    ggplot() +
+    theme(
+      legend.position = "bottom",
+      panel.spacing.y = unit(0, "lines"),
+      axis.title.x = element_blank(),
+      panel.border = element_blank(),
+      panel.grid.major.x = element_line(linetype = 3, color = "#757575", linewidth = .75),
+      legend.key = element_rect(
+        linewidth = 0,
+        linetype = 0
+      ),
+      axis.title.y = element_blank()) +
+    geom_bar(
+      stat = "identity",
+      position = "stack",
+      alpha = .8,
+      aes(
+        x = Abundance,
+        y = set,
+        fill = Phylum
+      )
+    ) +
+    facet_grid(rows =  vars(Diversity_lvl),
+      scales = "free_y") +
+  geom_text(
+    data = temp |> 
+      summarise(count = sum(count),
+                Abundance = sum(Abundance)),
+    aes(x = Abundance,
+        y = set,
+        label = count),
+    hjust = -.5,
+    size = 16,
+    color = "#333333") +
+  xlim(0, 15) +
+  scale_fill_manual(values = c("#F44336", "#9C27B0", "#3F51B5", "#E91E63", "#009688","#CDDC39", "#03A9F4",
+                                        "#FFEB3B",  "#4CAF50", "#FF9800", "#795548", "#607D8B"))
+
+png("core_barplot.png", width = 1600, height = 1600)
+core_plot
+dev.off()
+
+
+temp2 = 
+  temp |>
+  summarise(OTU = list(OTU)) |> 
+  pivot_wider(names_from = Diversity_lvl, values_from = OTU) |> 
+  map(~ pluck(.x))
+
+
+  
+ggvenn::ggvenn(temp2,
+               fill_color = palette_list$Diversity,
+               fill_alpha = .3,
+               text_size = 20,
+               set_name_size = 15,
+               show_percentage = F,
+               stroke_color = "#333333",
+               set_name_color = "#333333",
+               text_color = "#333333")
+
+
+p1 = stack_venn[[1]] + stack_venn[[2]] + stack_venn[[3]] + stack_venn[[4]] + stack_venn[[5]] +
+  stack_venn[[6]]
+
+png("venn_version4.png", width = 3000, height = 2000)
+p1 + plot_layout(ncol = 3)
+dev.off()
+
+
+c("#F44336", "#9C27B0", "#3F51B5", "#E91E63", "#009688","#CDDC39", "#03A9F4",
+                                        "#FFEB3B",  "#4CAF50", "#FF9800", "#795548", "#607D8B")
+
+summ_up = 
+  speedyseq::psmelt(mCom_id) %>% 
+  mutate(Diversity_lvl = Diversity_lvl %>%
+           factor(levels = c("lvl_1", "lvl_2", "lvl_4", "lvl_8", "lvl_16"))) %>% 
+  group_by(Treatment, Diversity_lvl, Genus) %>% 
+  summarise(Abundance = mean(scale(log(Abundance + 0.05), scale = F, center = T))) %>% 
+  left_join(res_ancombc_df, by = c("Genus", "Diversity_lvl")) %>% 
+  na.omit()
+
+png("heatmap_version3.png", width = 3000, height = 1500)
+
+httpgd::hgd()
+httpgd::hgd_browse()
+res_ancombc_df %>% 
+  group_by(Diversity_lvl) %>% 
+  filter(abs(W) > quantile(abs(W), probs = .99) & q_val < 0.05) %>% 
+  ggplot(aes(y = forcats::fct_reorder(Genus, lfc), x = lfc)) +
+  geom_rect(aes(xmin = -Inf, xmax = Inf,
+                ymin = -Inf, ymax = Inf),
+            linetype = 3,
+            color = "#757575",
+            alpha = 0) +
+  geom_col(aes(fill =  Phylum, color = after_scale(fill))) +
+  geom_errorbar(aes(xmin = lfc - se, xmax = lfc + se),
+                width = 0.4, color = "#757575") +
+  facet_grid(rows = vars(Diversity_lvl), scales = "free_y",
+             space = "free_y") +
+  geom_text(
+    aes(label = round(q_val, 3), x = ifelse(lfc < 0, -Inf, Inf)),
+    color = "#757575",
+    hjust = "inward",
+    size = 7.5, show.legend = F) +
+  paletteer::scale_fill_paletteer_d("ggthemes::stata_s2color") +
+  scale_color_manual(values = pal_divTr[seq(1, 12, 2)]) +
+  theme(axis.title.y = element_blank(),
+        panel.spacing.y = unit(0.1, "lines"),
+        panel.border = element_blank(),
+        strip.text.y.right = element_text(angle = 0))
+
+dev.off()
+
+
+```
+
+```{r}
+
+core_mem =
+  speedyseq::psmelt(mCom) %>% 
+  group_by(OTU, Treatment, Diversity_lvl) %>% 
+  summarise(Count  = n(),
+            Prev = sum(Abundance > 0)/n(),
+            Shared = Prev == 1)
+
+ 
+janitor::tabyl(core_mem, Treatment, Diversity_lvl, Shared)
+
+core_treat = 
+  speedyseq::psmelt(mCom) %>% 
+  group_by(OTU, Treatment) %>% 
+  summarise(Count  = n(),
+            Prev = sum(Abundance > 0)/n(),
+            Shared = Prev == 1)
+  
+core_treat %>% 
+  janitor::tabyl(Treatment, Shared)
+
+
+core_div = 
+  speedyseq::psmelt(mCom) %>% 
+  group_by(OTU, Diversity_lvl) %>% 
+  summarise(Count  = n(),
+            Prev = sum(Abundance > 0)/n(),
+            Shared = Prev == 1)
+  
+core_div %>% 
+  janitor::tabyl(Diversity_lvl, Shared)
+
+## yuri's way?
+
+
+list_core =
+  metagMisc::phyloseq_sep_variable(mCom, variable = "Diversity_lvl", drop_zeroes = T) %>% 
+  map(~ metagMisc::phyloseq_filter_prevalence(.x, prev.trh = 1) %>% 
+        transform("compositional") %>% 
+        speedyseq::psmelt()) %>% 
+  list_rbind()
+
+list_core %>% 
+  group_by(Diversity_lvl, Treatment, OTU) %>% 
+  summarise(Abundance = sum(Abundance)) %>% 
+  count()
+
+
+
+
+```
+ 
+## ANCOMBC2
+ 
+```{r}
+
+mCom_w60 = 
+  mCom |> 
+  subset_samples(Diversity_lvl != "60")
+
+res_ancombc2 = 
+  ANCOMBC::ancombc2(mCom,
+                    tax_level = "Genus",
+                    fix_formula = "log_sowndiv * Treatment",
+                    p_adj_method = "fdr",
+                    prv_cut = 0,
+                    n_cl = 7)
+
+
+         
+tidy_ancombc = 
+  res_ancombc2 %>% 
+  pluck("res") %>% 
+  rename_with(~ str_replace(.x, "log_", "log")) %>% 
+  pivot_longer(cols = -taxon,
+               names_to = c(".value", "term"), names_sep = "_") %>% 
+  mutate(DA = factor(case_when(
+    q > 0.01 & q <= 0.05 ~ "*",
+    q > 0.001 & q <= 0.01 ~ "**",
+    q > 0.0001 & q <= 0.001 ~ "***",
+    q <= 0.0001 ~ "****",
+    .default = "ns"), levels = c("ns", "*", "**", "***", "****")),
+    term = case_match(term,
+                      "(Intercept)" ~ "Intercept",
+                      "Treatmentdrought" ~ "Drought",
+                      "logsowndiv" ~ "Sown diversity",
+                      "logsowndiv:Treatmentdrought" ~ "Interaction")) |> 
+  left_join(tax_table(mCom) |> 
+              as.data.frame() |> 
+              rownames_to_column("taxon"))
+
+
+httpgd::hgd()
+httpgd::hgd_browse()
+tidy_ancombc %>% 
+  filter(q < 0.05) %>% 
+  ggplot(aes(y = forcats::fct_reorder(Genus, lfc), x = lfc)) +
+  geom_col(aes(fill =  Phylum, color = after_scale(fill))) +
+  geom_errorbar(aes(xmin = lfc - se, xmax = lfc + se),
+                width = 0.3, color = "#757575") +
+  facet_grid(rows = vars(term), 
+             scales = "free_y",
+             space = "free_y") +
+  geom_text(
+    aes(label = DA, x = ifelse(lfc < 0, -4, 4)),
+    color = "#757575",
+    size = 12, show.legend = F) +
+  paletteer::scale_fill_paletteer_d("ggthemes::stata_s2color") +
+  theme(axis.title.y = element_blank(),
+        panel.spacing.y = unit(0.1, "lines"),
+        panel.border = element_blank(),
+        strip.text.y.right = element_text(angle = 0))
+
+
+with_raw_data = 
+  tidy_ancombc %>% 
+  filter(diff) %>% 
+  left_join(speedyseq::psmelt(mCom)  %>% 
+              mutate(Abundance = log(Abundance + 1)/sum(Abundance),
+                     .by = sample_Sample) %>% 
+              group_by(OTU, Diversity_lvl, Treatment, Phylum, Genus) %>% 
+              summarise(across(where(is.numeric), ~ mean(.x))),
+            by = c("taxon" = "OTU"),
+            multiple = "all")
+
+
+with_raw_data %>% 
+  filter(diff == T) %>% 
+  ggplot() +
+  geom_point(aes(x = Diversity_lvl, y = Abundance, color = DA))
+
+
+```
+
